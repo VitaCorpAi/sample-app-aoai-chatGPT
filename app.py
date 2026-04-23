@@ -454,6 +454,7 @@ async def send_chat_request(request_body, request_headers):
             input=last_user_message or "Hello",
             instructions=system_prompt or app_settings.azure_openai.system_message or "You are a helpful assistant.",
             tools=[{"type": "web_search_preview"}],  # Включаем веб-поиск
+            tool_choice={"type": "web_search_preview"},  # ← ДОБАВЬТЕ ЭТУ СТРОКУ
             temperature=model_args.get("temperature", 0.7),
             max_output_tokens=model_args.get("max_tokens", 1000),
             top_p=model_args.get("top_p", 1),

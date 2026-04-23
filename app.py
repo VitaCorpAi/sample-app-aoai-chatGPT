@@ -418,6 +418,7 @@ async def process_function_call(response):
     
     return None
 
+# === ИЗМЕНЕННАЯ ФУНКЦИЯ ДЛЯ ВЕБ-ПОИСКА ===
 async def send_chat_request(request_body, request_headers):
     filtered_messages = []
     messages = request_body.get("messages", [])
@@ -430,42 +431,57 @@ async def send_chat_request(request_body, request_headers):
 
     try:
         azure_openai_client = await init_openai_client()
-        raw_response = await azure_openai_client.chat.completions.with_raw_response.create(**model_args)
-        response = raw_response.parse()
-        apim_request_id = raw_response.headers.get("apim-request-id") 
+        
+        # Извлекаем последнее сообщение пользователя и системный промпт
+        last_user_message = ""
+        system_prompt = ""
+        for msg in model_args["messages"]:
+            if msg["role"] == "user":
+                last_user_message = msg["content"]
+            elif msg["role"] == "system":
+                system_prompt = msg["content"]
+        
+        # Если не нашли сообщение пользователя, пробуем взять из оригинального body
+        if not last_user_message and request_body.get("messages"):
+            for msg in request_body["messages"]:
+                if msg.get("role") == "user":
+                    last_user_message = msg.get("content", "")
+                    break
+        
+        # Вызываем Responses API с веб-поиском
+        response = await azure_openai_client.responses.create(
+            model=model_args["model"],
+            input=last_user_message or "Hello",
+            instructions=system_prompt or app_settings.azure_openai.system_message or "You are a helpful assistant.",
+            tools=[{"type": "web_search_preview"}],  # Включаем веб-поиск
+            temperature=model_args.get("temperature", 0.7),
+            max_output_tokens=model_args.get("max_tokens", 1000),
+            top_p=model_args.get("top_p", 1),
+        )
+        
+        # Создаем объект, имитирующий ответ Chat Completions для совместимости
+        class MockResponse:
+            def __init__(self, resp):
+                self.choices = [MockChoice(resp)]
+                self.usage = None
+        
+        class MockChoice:
+            def __init__(self, resp):
+                self.message = MockMessage(resp)
+        
+        class MockMessage:
+            def __init__(self, resp):
+                self.content = resp.output_text
+                self.role = "assistant"
+                self.tool_calls = None
+        
+        apim_request_id = str(uuid.uuid4())
+        return MockResponse(response), apim_request_id
+        
     except Exception as e:
         logging.exception("Exception in send_chat_request")
         raise e
 
-    return response, apim_request_id
-
-
-async def complete_chat_request(request_body, request_headers):
-    if app_settings.base_settings.use_promptflow:
-        response = await promptflow_request(request_body)
-        history_metadata = request_body.get("history_metadata", {})
-        return format_pf_non_streaming_response(
-            response,
-            history_metadata,
-            app_settings.promptflow.response_field_name,
-            app_settings.promptflow.citations_field_name
-        )
-    else:
-        response, apim_request_id = await send_chat_request(request_body, request_headers)
-        history_metadata = request_body.get("history_metadata", {})
-        non_streaming_response = format_non_streaming_response(response, history_metadata, apim_request_id)
-
-        if app_settings.azure_openai.function_call_azure_functions_enabled:
-            function_response = await process_function_call(response)  # Add await here
-
-            if function_response:
-                request_body["messages"].extend(function_response)
-
-                response, apim_request_id = await send_chat_request(request_body, request_headers)
-                history_metadata = request_body.get("history_metadata", {})
-                non_streaming_response = format_non_streaming_response(response, history_metadata, apim_request_id)
-
-    return non_streaming_response
 
 class AzureOpenaiFunctionCallStreamState():
     def __init__(self):
@@ -536,30 +552,48 @@ async def stream_chat_request(request_body, request_headers):
     history_metadata = request_body.get("history_metadata", {})
     
     async def generate(apim_request_id, history_metadata):
-        if app_settings.azure_openai.function_call_azure_functions_enabled:
-            # Maintain state during function call streaming
-            function_call_stream_state = AzureOpenaiFunctionCallStreamState()
-            
-            async for completionChunk in response:
-                stream_state = await process_function_call_stream(completionChunk, function_call_stream_state, request_body, request_headers, history_metadata, apim_request_id)
-                
-                # No function call, asistant response
-                if stream_state == "INITIAL":
-                    yield format_stream_response(completionChunk, history_metadata, apim_request_id)
-
-                # Function call stream completed, functions were executed.
-                # Append function calls and results to history and send to OpenAI, to stream the final answer.
-                if stream_state == "COMPLETED":
-                    request_body["messages"].extend(function_call_stream_state.function_messages)
-                    function_response, apim_request_id = await send_chat_request(request_body, request_headers)
-                    async for functionCompletionChunk in function_response:
-                        yield format_stream_response(functionCompletionChunk, history_metadata, apim_request_id)
-                
+        # Для Responses API нет стриминга в том же виде, поэтому имитируем один чанк
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            yield format_stream_response(response, history_metadata, apim_request_id)
         else:
-            async for completionChunk in response:
-                yield format_stream_response(completionChunk, history_metadata, apim_request_id)
+            # Если ответ не в ожидаемом формате, создаем чанк вручную
+            chunk = {
+                "choices": [{
+                    "delta": {"content": response.choices[0].message.content if hasattr(response, 'choices') else str(response)},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield format_stream_response(chunk, history_metadata, apim_request_id)
 
     return generate(apim_request_id=apim_request_id, history_metadata=history_metadata)
+
+
+async def complete_chat_request(request_body, request_headers):
+    if app_settings.base_settings.use_promptflow:
+        response = await promptflow_request(request_body)
+        history_metadata = request_body.get("history_metadata", {})
+        return format_pf_non_streaming_response(
+            response,
+            history_metadata,
+            app_settings.promptflow.response_field_name,
+            app_settings.promptflow.citations_field_name
+        )
+    else:
+        response, apim_request_id = await send_chat_request(request_body, request_headers)
+        history_metadata = request_body.get("history_metadata", {})
+        non_streaming_response = format_non_streaming_response(response, history_metadata, apim_request_id)
+
+        if app_settings.azure_openai.function_call_azure_functions_enabled:
+            function_response = await process_function_call(response)
+
+            if function_response:
+                request_body["messages"].extend(function_response)
+
+                response, apim_request_id = await send_chat_request(request_body, request_headers)
+                history_metadata = request_body.get("history_metadata", {})
+                non_streaming_response = format_non_streaming_response(response, history_metadata, apim_request_id)
+
+    return non_streaming_response
 
 
 async def conversation_internal(request_body, request_headers):
@@ -1037,8 +1071,8 @@ async def ensure_cosmos():
             return jsonify({"error": "CosmosDB is not working"}), 500
 
 
+# === ИЗМЕНЕННАЯ ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ ЗАГОЛОВКОВ ===
 async def generate_title(conversation_messages) -> str:
-    ## make sure the messages are sorted by _ts descending
     title_prompt = "Summarize the conversation so far into a 4-word or less title. Do not use any quotation marks or punctuation. Do not include any other commentary or description."
 
     messages = [
@@ -1049,15 +1083,31 @@ async def generate_title(conversation_messages) -> str:
 
     try:
         azure_openai_client = await init_openai_client()
-        response = await azure_openai_client.chat.completions.create(
-            model=app_settings.azure_openai.model, messages=messages, temperature=1, max_tokens=64
+        
+        # Формируем контекст из истории сообщений
+        context = ""
+        for msg in messages:
+            context += f"{msg['role']}: {msg['content']}\n"
+        
+        response = await azure_openai_client.responses.create(
+            model=app_settings.azure_openai.model,
+            input=context,
+            max_output_tokens=64,
+            temperature=1,
         )
-
-        title = response.choices[0].message.content
-        return title
+        
+        title = response.output_text.strip()
+        # Убираем кавычки и лишние символы
+        title = title.replace('"', '').replace("'", "").replace(".", "").replace("?", "")
+        return title[:50]  # Ограничиваем длину
+        
     except Exception as e:
         logging.exception("Exception while generating title", e)
-        return messages[-2]["content"]
+        # Возвращаем первое сообщение пользователя как заголовок
+        for msg in conversation_messages:
+            if msg["role"] == "user":
+                return msg["content"][:50]
+        return "New Chat"
 
 
 app = create_app()

@@ -44,13 +44,11 @@ async def call_agent(user_message: str, conversation_history: list = None) -> st
         )
         
         # Получаем OpenAI клиент, привязанный к агенту
-        # Это ключевой момент — именно так SDK подключается к агенту
         openai_client = project_client.get_openai_client()
         
         # Формируем историю сообщений для контекста
         input_messages = []
         if conversation_history:
-            # Ограничиваем историю последними 10 сообщениями для контекста
             for msg in conversation_history[-10:]:
                 input_messages.append({
                     "role": msg.get("role", "user"),
@@ -61,12 +59,13 @@ async def call_agent(user_message: str, conversation_history: list = None) -> st
         input_messages.append({"role": "user", "content": user_message})
         
         # Отправляем запрос агенту через Responses API
+        # ✅ ИСПРАВЛЕНО: agent_name и agent_version
         response = openai_client.responses.create(
             input=input_messages,
             extra_body={
                 "agent_reference": {
-                    "name": AGENT_NAME,
-                    "version": AGENT_VERSION,
+                    "agent_name": AGENT_NAME,
+                    "agent_version": AGENT_VERSION,
                     "type": "agent_reference"
                 }
             }
@@ -76,7 +75,7 @@ async def call_agent(user_message: str, conversation_history: list = None) -> st
         
     except Exception as e:
         logging.exception(f"Error calling agent: {e}")
-        return f"Извините, произошла ошибка при обработке запроса: {str(e)}"
+        return f"Извините, произошла ошибка: {str(e)}"
 
 @bp.route("/conversation", methods=["POST"])
 async def conversation():
@@ -89,16 +88,11 @@ async def conversation():
     if not messages:
         return jsonify({"error": "No messages provided"}), 400
     
-    # Извлекаем последнее сообщение пользователя
     user_message = messages[-1].get("content", "")
-    
-    # Извлекаем историю для контекста (без последнего сообщения, его добавим отдельно)
     conversation_history = messages[:-1] if len(messages) > 1 else None
     
-    # Вызываем агента
     response_text = await call_agent(user_message, conversation_history)
     
-    # Формируем ответ в формате, ожидаемом фронтендом
     response_data = {
         "id": str(uuid.uuid4()),
         "model": AGENT_NAME,
